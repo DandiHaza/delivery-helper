@@ -41,6 +41,17 @@ def get_message(row, cols):
             return str(row[col]).strip()
     return ""
 
+def detect_market_by_columns(df):
+    cols = set(df.columns.astype(str))
+
+    required_11st = {'주문번호', '주소', '상품명', '수량'}
+    name_cols_11st = {'수취인', '받는분'}
+    phone_cols_11st = {'휴대폰번호', '수취인연락처'}
+    if required_11st.issubset(cols) and cols.intersection(name_cols_11st) and cols.intersection(phone_cols_11st):
+        return '11st_manual'
+
+    return None
+
 def sort_xlsx_preserving_format(file_content, target_col_name):
     """원본 서식을 유지하며 업체상품코드 기준으로 정렬"""
     try:
@@ -83,6 +94,27 @@ def process_data(file_name, content):
             market_key = k
             config = v
             break
+
+    if market_key == 'unknown':
+        # 파일명으로 매칭되지 않는 경우 컬럼 기반 탐지 시도 (11번가 주문시트 등)
+        try:
+            df_probe = pd.read_csv(io.BytesIO(content)) if file_name.endswith('.csv') \
+                else pd.read_excel(io.BytesIO(content))
+            detected = detect_market_by_columns(df_probe)
+            if detected:
+                market_key = detected
+                config = MARKET_CONFIG[detected]
+            else:
+                # 11번가 주문시트가 상단에 안내 행이 있는 경우를 위한 추가 시도
+                df_probe = pd.read_csv(io.BytesIO(content), skiprows=2) if file_name.endswith('.csv') \
+                    else pd.read_excel(io.BytesIO(content), skiprows=2)
+                detected = detect_market_by_columns(df_probe)
+                if detected:
+                    market_key = detected
+                    config = dict(MARKET_CONFIG[detected])
+                    config['skip'] = 2
+        except Exception:
+            pass
 
     if market_key == 'unknown':
         return pd.DataFrame()
