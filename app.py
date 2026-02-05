@@ -4,6 +4,7 @@ import re
 import io
 import openpyxl
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 # 페이지 설정
 st.set_page_config(
@@ -293,7 +294,7 @@ if st.button("🚀 발주 파일 생성", type="primary", disabled=not uploaded_
         combined_list = []
         coupang_sorted = None
         
-        now = datetime.now()
+        now = datetime.now(ZoneInfo("Asia/Seoul"))
         date_prefix = now.strftime('%m%d')
         time_suffix = '09' if now.hour < 12 else '16'
         
