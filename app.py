@@ -123,6 +123,15 @@ def process_data(file_name, content):
         df = pd.read_csv(io.BytesIO(content), skiprows=config.get('skip', 0)) if file_name.endswith('.csv') \
              else pd.read_excel(io.BytesIO(content), skiprows=config.get('skip', 0))
 
+        # 11번가 주문시트는 파일명 매칭이 되더라도 헤더 위치가 다를 수 있어 재시도
+        if market_key in ['11st', '11st_manual']:
+            required_11st = {'주문번호', '주소', '상품명', '수량'}
+            if not required_11st.issubset(set(df.columns.astype(str))):
+                df_retry = pd.read_csv(io.BytesIO(content), skiprows=2) if file_name.endswith('.csv') \
+                    else pd.read_excel(io.BytesIO(content), skiprows=2)
+                if required_11st.issubset(set(df_retry.columns.astype(str))):
+                    df = df_retry
+
         if market_key == 'naver':
             df['final_msg'] = df.apply(lambda r: get_message(r, ['배송메세지', '비고']), axis=1)
             mapped = pd.DataFrame({
@@ -161,7 +170,9 @@ def process_data(file_name, content):
             })
         elif market_key in ['11st', '11st_manual']:
             name_col = '수취인' if '수취인' in df.columns else '받는분'
-            phone_col = '휴대폰번호' if '휴대폰번호' in df.columns else '수취인연락처'
+            phone_col = '휴대폰번호' if '휴대폰번호' in df.columns else (
+                '수취인연락처' if '수취인연락처' in df.columns else '전화번호'
+            )
             df['final_msg'] = df.apply(lambda r: get_message(r, ['배송메시지', '배송메세지', '비고']), axis=1)
             mapped = pd.DataFrame({
                 '고객주문번호': df['주문번호'].astype(str),
