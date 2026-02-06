@@ -30,10 +30,30 @@ def clean_phone(phone):
     return re.sub(r'[^0-9]', '', str(phone))
 
 def identify_product(name):
-    name_upper = str(name).upper()
+    name_str = str(name)
+    name_upper = name_str.upper()
+    name_lower = name_str.lower()
+    
+    # OH, PH, SH 우선 확인
     if 'OH' in name_upper: return 'OH'
     if 'PH' in name_upper: return 'PH'
     if 'SH' in name_upper: return 'SH'
+    
+    # 기타 제품 매핑
+    if '케이블' in name_str:
+        if '스위치' in name_str:
+            return '케이블s'
+        else:
+            return '케이블(일반)'
+    if '거치대' in name_str or '휴대폰' in name_str:
+        return '휴대폰거치대'
+    if '번호판' in name_str or '차량번호' in name_str:
+        return '차량번호판'
+    if '망치' in name_str or '차량용망치' in name_str:
+        return '차량용망치'
+    if '도막' in name_str or '측정기' in name_str:
+        return '도막측정기'
+    
     return name
 
 def get_message(row, cols):
@@ -92,6 +112,45 @@ def sort_xlsx_preserving_format(file_content, target_col_name):
                 cell = ws.cell(row=r_idx, column=c_idx, value=val)
                 if style:
                     cell._style = style
+        
+        output = io.BytesIO()
+        wb.save(output)
+        output.seek(0)
+        return output.getvalue()
+    except Exception as e:
+        return None
+
+def add_invoice_to_coupang(file_content, file_name, invoice_map):
+    """쿠팡 파일에 운송장번호 추가 (서식 유지)"""
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(file_content))
+        ws = wb.active
+        header = [cell.value for cell in ws[1]]
+        
+        # 주문번호와 운송장번호 컬럼 찾기
+        try:
+            order_col_idx = header.index('주문번호') + 1
+        except:
+            return None
+        
+        # 운송장번호 컬럼이 있는지 확인
+        if '운송장번호' in header:
+            invoice_col_idx = header.index('운송장번호') + 1
+        else:
+            # 없으면 맨 끝에 추가
+            invoice_col_idx = len(header) + 1
+            ws.cell(row=1, column=invoice_col_idx, value='운송장번호')
+        
+        # 데이터 행에 운송장번호 추가
+        for row_idx in range(2, ws.max_row + 1):
+            order_no = str(ws.cell(row=row_idx, column=order_col_idx).value)
+            invoice = invoice_map.get(order_no, '')
+            
+            cell = ws.cell(row=row_idx, column=invoice_col_idx)
+            cell.value = invoice
+            # 숫자를 텍스트로 저장하여 E 표기 방지
+            if invoice:
+                cell.number_format = '@'  # 텍스트 형식
         
         output = io.BytesIO()
         wb.save(output)
@@ -266,6 +325,10 @@ if 'order_mgmt_info' not in st.session_state:
     st.session_state.order_mgmt_info = None
 if 'order_mgmt_preview' not in st.session_state:
     st.session_state.order_mgmt_preview = None
+if 'order_mgmt_raw_data' not in st.session_state:
+    st.session_state.order_mgmt_raw_data = None
+if 'coupang_delivery_file' not in st.session_state:
+    st.session_state.coupang_delivery_file = None
 if 'uploaded_market_files' not in st.session_state:
     st.session_state.uploaded_market_files = None
 
@@ -273,26 +336,57 @@ if 'uploaded_market_files' not in st.session_state:
 with st.expander("📖 사용법", expanded=False):
     st.markdown("""
     ### 📦 발주 파일 생성
-    1. **네이버 파일**: 암호가 있는 경우 먼저 제거해주세요
-       - 엑셀 파일 열기 → F12 → 도구 → 일반 옵션 → 비밀번호 삭제 → 저장
-    2. 아래에서 각 마켓의 발주 파일을 업로드하세요
-    3. **파일 생성** 버튼을 클릭하세요
-    4. 생성된 파일을 원하는 만큼 다운로드하세요 (여러 번 가능)
-    5. 새로운 파일을 처리하려면 **초기화** 버튼을 누르고 다시 시작하세요
+    **파일 준비**
+    - **네이버 파일**: 암호가 있는 경우 먼저 제거해주세요
+      - 엑셀 파일 열기 → F12 → 도구 → 일반 옵션 → 비밀번호 삭제 → 저장
+    
+    **사용 순서**
+    1. 아래 "📂 파일 업로드"에서 각 마켓의 발주 파일을 업로드하세요 (여러 개 동시 선택 가능)
+    2. **파일 생성** 버튼을 클릭하세요
+    3. 생성된 파일을 다운로드하세요 (여러 번 가능)
+       - `MMDD_HH.xlsx`: CJ택배 업로드용 통합 발주 파일
+       - `MMDD_HH_쿠팡_원본정렬.xlsx`: 쿠팡 파일 정렬본 (쿠팡 파일이 있는 경우)
+    4. 새로운 파일을 처리하려면 **초기화** 버튼을 누르고 다시 시작하세요
+    
+    ---
     
     ### 📋 주문관리 시트 생성
-    1. CJ 송장 파일(엑셀)을 업로드하세요
-    2. 각 마켓의 주문 파일을 업로드하세요 (여러 개 가능)
-    3. **주문관리시트 생성** 버튼을 클릭하세요
-    4. 같은 주문번호의 제품이 자동으로 합쳐집니다 (예: OH 2개, PH 1개)
-    5. CJ 고객주문번호와 매칭되는 송장번호가 자동으로 입력됩니다
+    **파일 준비**
+    - **CJ택배 파일**: CJ 배송 실적 출력 파일 (운송장번호와 고객주문번호 포함)
+    - **마켓 주문 파일**: 각 마켓의 주문 내역 파일 (위에서 업로드한 파일 재사용 가능)
     
-    ### 지원 마켓
+    **사용 순서**
+    1. "📋 주문관리 시트 생성" 섹션으로 이동하세요
+    2. CJ택배 파일을 업로드하세요
+    3. 마켓 주문 파일을 업로드하세요
+       - 위에서 이미 업로드했다면 "위에서 업로드한 파일 재사용" 체크박스 선택
+    4. **주문관리시트 생성** 버튼을 클릭하세요
+    5. 생성된 파일을 다운로드하세요
+       - `주문관리_MMDD_HH.xlsx`: 송장번호 매칭된 통합 주문 관리 시트
+       - `쿠팡발송_MMDD_HH.xlsx`: 쿠팡 발송용 파일 (원본 서식 유지 + 운송장번호)
+    6. 데이터 미리보기와 품목별 판매 집계를 확인하세요
+    
+    **자동 기능**
+    - ✅ 같은 주문번호의 제품 자동 통합 (예: OH 2개, PH 1개 → 한 줄로 표시)
+    - ✅ CJ 고객주문번호와 매칭되는 송장번호 자동 입력
+    - ✅ 발주파일과 동일한 순서로 자동 정렬 (마켓별 → 제품별)
+    - ✅ 옥션/지마켓 자동 구분 (주문번호 패턴 분석)
+    - ✅ 제품명 자동 분류 (OH, PH, SH, 케이블, 거치대, 번호판 등 9종)
+    - ✅ 쿠팡 발송 파일 자동 생성 (원본 서식 유지, 운송장번호 추가)
+    
+    ---
+    
+    ### 📌 지원 마켓
     - 네이버 스마트스토어
     - 쿠팡 (DeliveryList)
     - 자사몰 (orders)
     - ESM (지마켓/옥션 - 신규주문)
     - 11번가 (allList)
+    
+    ### 💡 참고사항
+    - 파일명 시간 형식: MMDD_HH (예: 0206_15 = 2월 6일 오후 3시)
+    - 동일한 배송지로 여러 상품 주문 시 자동 통합
+    - 정렬 순서: 네이버→쿠팡→자사몰→지마켓→11번가 / OH→PH→SH→기타
     """)
 
 st.markdown("### 📂 파일 업로드")
@@ -557,7 +651,7 @@ if st.button("🔗 주문관리시트 생성", type="primary", key="gen_order_mg
                         df['final_msg'] = df.apply(lambda r: get_message(r, ['배송메세지', '비고']), axis=1)
                         
                         for _, row in df.iterrows():
-                            order_no = str(row['주문번호'])
+                            order_no = str(row['주문번호']).strip()
                             all_orders.append({
                                 '날짜': today_str,
                                 '채널': channel_name,
@@ -578,7 +672,7 @@ if st.button("🔗 주문관리시트 생성", type="primary", key="gen_order_mg
                         df['final_msg'] = df.apply(lambda r: get_message(r, ['배송메세지', '비고']), axis=1)
                         
                         for _, row in df.iterrows():
-                            order_no = str(row['주문번호'])
+                            order_no = str(row['주문번호']).strip()
                             all_orders.append({
                                 '날짜': today_str,
                                 '채널': channel_name,
@@ -599,10 +693,22 @@ if st.button("🔗 주문관리시트 생성", type="primary", key="gen_order_mg
                         df['final_msg'] = df.apply(lambda r: get_message(r, ['배송시 요구사항', '배송메세지', '비고']), axis=1)
                         
                         for _, row in df.iterrows():
-                            order_no = str(row['주문번호'])
+                            order_no = str(row['주문번호']).strip()
+                            
+                            # 주문번호 패턴으로 옥션/지마켓 구분
+                            if len(order_no) == 10:
+                                if order_no.startswith('2'):
+                                    actual_channel = '옥션'
+                                elif order_no.startswith('4'):
+                                    actual_channel = '지마켓'
+                                else:
+                                    actual_channel = channel_name
+                            else:
+                                actual_channel = channel_name
+                            
                             all_orders.append({
                                 '날짜': today_str,
-                                '채널': channel_name,
+                                '채널': actual_channel,
                                 '주문번호': order_no,
                                 '상품명': identify_product(row.get('상품명', '')),
                                 '수량': row.get('수량', ''),
@@ -622,7 +728,7 @@ if st.button("🔗 주문관리시트 생성", type="primary", key="gen_order_mg
                         df['final_msg'] = df.apply(lambda r: get_message(r, ['배송메시지', '배송메세지', '비고']), axis=1)
                         
                         for _, row in df.iterrows():
-                            order_no = str(row['주문번호'])
+                            order_no = str(row['주문번호']).strip()
                             all_orders.append({
                                 '날짜': today_str,
                                 '채널': channel_name,
@@ -643,7 +749,7 @@ if st.button("🔗 주문관리시트 생성", type="primary", key="gen_order_mg
                         df['final_msg'] = df.apply(lambda r: get_message(r, ['비고', '배송메세지']), axis=1)
                         
                         for _, row in df.iterrows():
-                            order_no = str(row['주문번호'])
+                            order_no = str(row['주문번호']).strip()
                             all_orders.append({
                                 '날짜': today_str,
                                 '채널': channel_name,
@@ -698,6 +804,14 @@ if st.button("🔗 주문관리시트 생성", type="primary", key="gen_order_mg
                             else:
                                 formatted.append(str(prod))
                         
+                        # 첫 번째 제품으로 정렬키 결정
+                        first_prod = sorted_prods[0][0] if sorted_prods else ''
+                        first_prod_priority = get_sort_priority(first_prod)[0]
+                        
+                        # 마켓 순서 매핑
+                        market_order_map = {'네이버': 1, '쿠팡': 2, '자사몰': 3, '지마켓': 4, '11번가': 5}
+                        market_order = market_order_map.get(channel, 99)
+                        
                         consolidated_list.append({
                             '날짜': group.iloc[0]['날짜'],
                             '채널': channel,
@@ -709,11 +823,32 @@ if st.button("🔗 주문관리시트 생성", type="primary", key="gen_order_mg
                             '전화번호': group.iloc[0]['전화번호'],
                             '주소': group.iloc[0]['주소'],
                             '비고': group.iloc[0]['비고'],
-                            '송장번호': group.iloc[0]['송장번호']
+                            '송장번호': group.iloc[0]['송장번호'],
+                            '마켓순서': market_order,
+                            '상품순서': first_prod_priority
                         })
                     
                     consolidated = pd.DataFrame(consolidated_list)
-                    consolidated = consolidated.sort_values(by='상품명')
+                    # 발주파일과 같은 순서로 정렬: 마켓 → 상품
+                    consolidated = consolidated.sort_values(by=['마켓순서', '상품순서'])
+                    # 정렬용 컬럼 제거
+                    consolidated = consolidated.drop(columns=['마켓순서', '상품순서'])
+                    
+                    # 쿠팡 발송 파일 생성
+                    coupang_delivery = None
+                    if use_existing and st.session_state.uploaded_market_files:
+                        # 업로드된 파일에서 쿠팡 파일 찾기
+                        for file_name, content in st.session_state.uploaded_market_files:
+                            if 'DeliveryList' in file_name:
+                                coupang_delivery = add_invoice_to_coupang(content, file_name, invoice_map)
+                                break
+                    elif market_files:
+                        # 새로 업로드한 파일에서 쿠팡 파일 찾기
+                        for f in market_files:
+                            if 'DeliveryList' in f.name:
+                                content = f.read()
+                                coupang_delivery = add_invoice_to_coupang(content, f.name, invoice_map)
+                                break
                     
                     # 엑셀 파일 생성
                     output = io.BytesIO()
@@ -730,6 +865,8 @@ if st.button("🔗 주문관리시트 생성", type="primary", key="gen_order_mg
                         'matched': len(consolidated[consolidated['송장번호'] != ''])
                     }
                     st.session_state.order_mgmt_preview = consolidated
+                    st.session_state.order_mgmt_raw_data = all_orders
+                    st.session_state.coupang_delivery_file = coupang_delivery
                     
                     st.success("✅ 주문관리시트 생성 완료!")
                     st.rerun()
@@ -742,22 +879,70 @@ if st.button("🔗 주문관리시트 생성", type="primary", key="gen_order_mg
 # 주문관리시트 다운로드
 if st.session_state.order_mgmt_file:
     st.markdown("### 📥 주문관리시트 다운로드")
-    st.download_button(
-        label="📋 주문관리시트 다운로드",
-        data=st.session_state.order_mgmt_file,
-        file_name=st.session_state.order_mgmt_info['filename'],
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.download_button(
+            label="📋 주문관리시트 다운로드",
+            data=st.session_state.order_mgmt_file,
+            file_name=st.session_state.order_mgmt_info['filename'],
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
+    
+    if st.session_state.coupang_delivery_file:
+        with col2:
+            now = datetime.now(ZoneInfo("Asia/Seoul"))
+            coupang_filename = f"쿠팡발송_{now.strftime('%m%d_%H')}.xlsx"
+            st.download_button(
+                label="📦 쿠팡 발송 파일 다운로드",
+                data=st.session_state.coupang_delivery_file,
+                file_name=coupang_filename,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
+    
     st.info(f"총 {st.session_state.order_mgmt_info['count']}건 | 송장번호 매칭 {st.session_state.order_mgmt_info['matched']}건")
     
     # 미리보기
     with st.expander("📊 데이터 미리보기", expanded=True):
         st.dataframe(st.session_state.order_mgmt_preview, use_container_width=True)
     
+    # 품목별 판매 집계
+    if st.session_state.order_mgmt_raw_data:
+        with st.expander("📈 품목별 판매 집계", expanded=False):
+            raw_df = pd.DataFrame(st.session_state.order_mgmt_raw_data)
+            product_summary = raw_df.groupby('상품명')['수량'].sum().reset_index()
+            product_summary.columns = ['품목', '판매 수량']
+            
+            # 품목 순서 정의
+            product_order = {
+                'OH': 0,
+                'PH': 1,
+                'SH': 2,
+                '케이블(일반)': 3,
+                '케이블s': 4,
+                '휴대폰거치대': 5,
+                '차량번호판': 6,
+                '차량용망치': 7,
+                '도막측정기': 8
+            }
+            
+            # 정렬키 추가
+            product_summary['순서'] = product_summary['품목'].map(lambda x: product_order.get(x, 99))
+            product_summary = product_summary.sort_values(by='순서')
+            product_summary = product_summary[['품목', '판매 수량']]
+            
+            st.dataframe(product_summary, use_container_width=True, hide_index=True)
+            st.info(f"총 품목 수: {len(product_summary)}개")
+    
     if st.button("🔄 새 주문관리시트 생성", key="reset_mgmt"):
         st.session_state.order_mgmt_file = None
         st.session_state.order_mgmt_info = None
         st.session_state.order_mgmt_preview = None
+        st.session_state.order_mgmt_raw_data = None
+        st.session_state.coupang_delivery_file = None
         st.rerun()
 
 # Footer
@@ -765,7 +950,7 @@ st.markdown("---")
 st.markdown(
     """
     <div style='text-align: center; color: gray;'>
-    자동 발주 파일 생성기 | Made with ❤️ using Streamlit
+    자동 발주 파일 생성기 | Made by 🦖 DandiHaza
     </div>
     """,
     unsafe_allow_html=True
