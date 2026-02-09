@@ -126,6 +126,43 @@ def sort_xlsx_preserving_format(file_content, target_col_name):
     except Exception as e:
         return None
 
+def _set_text_format_for_columns(ws, header, target_cols=None, keyword_cols=None):
+    target_cols = target_cols or []
+    keyword_cols = keyword_cols or []
+    col_indexes = set()
+
+    for col_name in target_cols:
+        if col_name in header:
+            col_indexes.add(header.index(col_name) + 1)
+
+    for idx, name in enumerate(header, start=1):
+        name_str = str(name) if name is not None else ""
+        if any(keyword in name_str for keyword in keyword_cols):
+            col_indexes.add(idx)
+
+    if not col_indexes:
+        return
+
+    for col_idx in col_indexes:
+        for row_idx in range(2, ws.max_row + 1):
+            cell = ws.cell(row=row_idx, column=col_idx)
+            if cell.value is not None:
+                cell.value = str(cell.value)
+            cell.number_format = '@'
+
+def apply_text_format_to_excel_bytes(file_bytes, target_cols=None, keyword_cols=None):
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(file_bytes))
+        ws = wb.active
+        header = [cell.value for cell in ws[1]]
+        _set_text_format_for_columns(ws, header, target_cols=target_cols, keyword_cols=keyword_cols)
+        output = io.BytesIO()
+        wb.save(output)
+        output.seek(0)
+        return output.getvalue()
+    except Exception:
+        return file_bytes
+
 def add_invoice_to_coupang(file_content, file_name, invoice_map):
     """쿠팡 파일에 운송장번호 추가 (서식 유지)"""
     try:
@@ -157,6 +194,12 @@ def add_invoice_to_coupang(file_content, file_name, invoice_map):
             # 숫자를 텍스트로 저장하여 E 표기 방지
             if invoice:
                 cell.number_format = '@'  # 텍스트 형식
+
+        _set_text_format_for_columns(
+            ws,
+            header,
+            keyword_cols=['전화', '연락처', '휴대폰']
+        )
         
         output = io.BytesIO()
         wb.save(output)
@@ -453,6 +496,11 @@ if st.button("🚀 발주 파일 생성", type="primary", disabled=not uploaded_
             # 쿠팡 파일인 경우 정렬된 버전 생성
             if 'DeliveryList' in file_name:
                 coupang_sorted = sort_xlsx_preserving_format(content, '업체상품코드')
+                if coupang_sorted:
+                    coupang_sorted = apply_text_format_to_excel_bytes(
+                        coupang_sorted,
+                        keyword_cols=['전화', '연락처', '휴대폰']
+                    )
             
             # 데이터 처리
             temp_df = process_data(file_name, content)
@@ -481,9 +529,14 @@ if st.button("🚀 발주 파일 생성", type="primary", disabled=not uploaded_
                 '배송메세지': '배송메세지1'
             }).to_excel(output, index=False, columns=final_cols)
             output.seek(0)
+            formatted_order_file = apply_text_format_to_excel_bytes(
+                output.getvalue(),
+                target_cols=['받는분전화번호'],
+                keyword_cols=['전화', '연락처', '휴대폰']
+            )
             
             # 세션 상태에 저장
-            st.session_state.generated_file = output.getvalue()
+            st.session_state.generated_file = formatted_order_file
             st.session_state.coupang_file = coupang_sorted
             st.session_state.file_info = {
                 'filename': final_filename,
@@ -662,7 +715,15 @@ if st.button("🔗 주문관리시트 생성", type="primary", key="gen_order_mg
                                 df.columns = df.columns.astype(str).str.strip()
                     
                     # 마켓별 데이터 추출
-                    channel_name = {'naver': '네이버', 'coupang': '쿠팡', 'own': '자사몰', 'esm': '지마켓', '11st': '11번가', '11st_manual': '11번가'}.get(market_key, '기타')
+                    channel_name = {
+                        'naver': '네이버',
+                        'coupang': '쿠팡',
+                        'own': '자사몰',
+                        'esm': '지마켓',
+                        '11st': '11번가',
+                        '11st_manual': '11번가',
+                        'wadiz': '와디즈'
+                    }.get(market_key, '기타')
                     
                     if market_key == 'naver':
                         date_col = pick_first_col(df.columns, ['결제일', '주문일', '결제일시', '주문일시'])
@@ -782,6 +843,25 @@ if st.button("🔗 주문관리시트 생성", type="primary", key="gen_order_mg
                                 '비고': row.get('final_msg', ''),
                                 '송장번호': invoice_map.get(order_no, '')
                             })
+                    elif market_key == 'wadiz':
+                        buyer_col = pick_first_col(df.columns, ['서포터 이름', '주문자', '구매자', '주문자명', '구매자명'])
+                        df['final_msg'] = df.apply(lambda r: get_message(r, ['배송 요청 사항', '주문 요청 사항']), axis=1)
+
+                        for _, row in df.iterrows():
+                            order_no = str(row.get('주문 번호', '')).strip()
+                            all_orders.append({
+                                '날짜': today_str,
+                                '채널': channel_name,
+                                '주문번호': order_no,
+                                '상품명': identify_product(row.get('주문 상품', '')),
+                                '수량': row.get('주문 수량', ''),
+                                '주문인': row.get(buyer_col, '') if buyer_col else '',
+                                '수취인': row.get('받는 분', ''),
+                                '전화번호': clean_phone(row.get('받는 분 연락처', '')),
+                                '주소': row.get('배송지 주소', ''),
+                                '비고': row.get('final_msg', ''),
+                                '송장번호': invoice_map.get(order_no, '')
+                            })
                 
                 # 주문관리시트 생성
                 if all_orders:
@@ -828,7 +908,15 @@ if st.button("🔗 주문관리시트 생성", type="primary", key="gen_order_mg
                         first_prod_priority = get_sort_priority(first_prod)[0]
                         
                         # 마켓 순서 매핑
-                        market_order_map = {'네이버': 1, '쿠팡': 2, '자사몰': 3, '지마켓': 4, '11번가': 5}
+                        market_order_map = {
+                            '네이버': 1,
+                            '쿠팡': 2,
+                            '자사몰': 3,
+                            '옥션': 4,
+                            '지마켓': 4,
+                            '11번가': 5,
+                            '와디즈': 6
+                        }
                         market_order = market_order_map.get(channel, 99)
                         
                         consolidated_list.append({
@@ -860,6 +948,11 @@ if st.button("🔗 주문관리시트 생성", type="primary", key="gen_order_mg
                         for file_name, content in st.session_state.uploaded_market_files:
                             if 'DeliveryList' in file_name:
                                 coupang_delivery = add_invoice_to_coupang(content, file_name, invoice_map)
+                                if coupang_delivery:
+                                    coupang_delivery = apply_text_format_to_excel_bytes(
+                                        coupang_delivery,
+                                        keyword_cols=['전화', '연락처', '휴대폰']
+                                    )
                                 break
                     elif market_files:
                         # 새로 업로드한 파일에서 쿠팡 파일 찾기
@@ -867,17 +960,27 @@ if st.button("🔗 주문관리시트 생성", type="primary", key="gen_order_mg
                             if 'DeliveryList' in f.name:
                                 content = f.read()
                                 coupang_delivery = add_invoice_to_coupang(content, f.name, invoice_map)
+                                if coupang_delivery:
+                                    coupang_delivery = apply_text_format_to_excel_bytes(
+                                        coupang_delivery,
+                                        keyword_cols=['전화', '연락처', '휴대폰']
+                                    )
                                 break
                     
                     # 엑셀 파일 생성
                     output = io.BytesIO()
                     consolidated.to_excel(output, index=False)
                     output.seek(0)
+                    formatted_order_mgmt = apply_text_format_to_excel_bytes(
+                        output.getvalue(),
+                        target_cols=['전화번호'],
+                        keyword_cols=['전화', '연락처', '휴대폰']
+                    )
                     
                     now = datetime.now(ZoneInfo("Asia/Seoul"))
                     filename = f"주문관리_{now.strftime('%m%d_%H')}.xlsx"
                     
-                    st.session_state.order_mgmt_file = output.getvalue()
+                    st.session_state.order_mgmt_file = formatted_order_mgmt
                     st.session_state.order_mgmt_info = {
                         'filename': filename,
                         'count': len(consolidated),
