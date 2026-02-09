@@ -22,7 +22,8 @@ MARKET_CONFIG = {
     'own': {'key': 'orders', 'skip': 0, 'order': 3},
     'esm': {'key': '신규주문', 'skip': 0, 'order': 4},
     '11st': {'key': 'allList', 'skip': 2, 'order': 5},
-    '11st_manual': {'key': '11번가', 'skip': 0, 'order': 5}
+    '11st_manual': {'key': '11번가', 'skip': 0, 'order': 5},
+    'wadiz': {'key': '발송 처리용 주문', 'skip': 0, 'order': 6}
 }
 
 def clean_phone(phone):
@@ -78,6 +79,11 @@ def format_date(value):
 
 def detect_market_by_columns(df):
     cols = set(df.columns.astype(str))
+
+    # 와디즈 감지 (고유 컬럼)
+    required_wadiz = {'주문 번호', '주문 상품', '주문 수량', '받는 분'}
+    if required_wadiz.issubset(cols):
+        return 'wadiz'
 
     required_11st = {'주문번호', '주소', '상품명', '수량'}
     name_cols_11st = {'수취인', '받는분'}
@@ -258,6 +264,18 @@ def process_data(file_name, content):
                 '수량': df['수량'],
                 '내부정렬키': df['상품명'].astype(str)
             })
+        elif market_key == 'wadiz':
+            df['final_msg'] = df.apply(lambda r: get_message(r, ['배송 요청 사항', '주문 요청 사항']), axis=1)
+            mapped = pd.DataFrame({
+                '고객주문번호': df['주문 번호'].astype(str),
+                '받는분성명': df['받는 분'],
+                '받는분전화번호': df['받는 분 연락처'].apply(clean_phone),
+                '받는분주소': df['배송지 주소'],
+                '배송메세지': df['final_msg'],
+                '품목': df['주문 상품'].apply(identify_product),
+                '수량': df['주문 수량'],
+                '내부정렬키': df['주문 상품'].astype(str)
+            })
         elif market_key == 'own':
             df['final_msg'] = df.apply(lambda r: get_message(r, ['비고', '배송메세지']), axis=1)
             mapped = pd.DataFrame({
@@ -379,6 +397,7 @@ with st.expander("📖 사용법", expanded=False):
     ### 📌 지원 마켓
     - 네이버 스마트스토어
     - 쿠팡 (DeliveryList)
+    - 와디즈 (발송 처리용 주문)
     - 자사몰 (orders)
     - ESM (지마켓/옥션 - 신규주문)
     - 11번가 (allList)
@@ -386,7 +405,7 @@ with st.expander("📖 사용법", expanded=False):
     ### 💡 참고사항
     - 파일명 시간 형식: MMDD_HH (예: 0206_15 = 2월 6일 오후 3시)
     - 동일한 배송지로 여러 상품 주문 시 자동 통합
-    - 정렬 순서: 네이버→쿠팡→자사몰→지마켓→11번가 / OH→PH→SH→기타
+    - 정렬 순서: 네이버→쿠팡→자사몰→ESM→11번가→와디즈 / OH→PH→SH→기타
     """)
 
 st.markdown("### 📂 파일 업로드")
