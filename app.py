@@ -41,6 +41,9 @@ def identify_product(name):
     if 'SH' in name_upper: return 'SH'
     
     # 기타 제품 매핑
+    name_lower = name_str.lower()
+    if '케이블s' in name_lower:
+        return '케이블s'
     if '케이블' in name_str:
         if '스위치' in name_str:
             return '케이블s'
@@ -208,6 +211,88 @@ def add_invoice_to_coupang(file_content, file_name, invoice_map):
     except Exception as e:
         st.warning(f"쿠팡 정렬 중 오류: {e}")
         return None
+
+def _split_paste_line(line):
+    if '\t' in line:
+        return [c.strip() for c in line.split('\t')]
+    if ',' in line:
+        return [c.strip() for c in line.split(',')]
+    return [line.strip()]
+
+def parse_pasted_sales(text, normalize=True):
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    if not lines:
+        return pd.DataFrame(columns=['상품명', '수량']), 0
+
+    name_idx = None
+    qty_idx = None
+    start_idx = 0
+
+    header_cols = _split_paste_line(lines[0])
+    for idx, col in enumerate(header_cols):
+        col_str = str(col)
+        if any(k in col_str for k in ['상품', '품목']):
+            name_idx = idx
+        if '수량' in col_str:
+            qty_idx = idx
+    if name_idx is not None and qty_idx is not None:
+        start_idx = 1
+
+    parsed = []
+    for line in lines[start_idx:]:
+        cols = _split_paste_line(line)
+
+        name = ""
+        qty_str = ""
+
+        if name_idx is not None and qty_idx is not None and len(cols) > max(name_idx, qty_idx):
+            name = cols[name_idx]
+            qty_str = cols[qty_idx]
+        elif len(cols) >= 2:
+            name = cols[0]
+            for c in cols[1:]:
+                if re.search(r'\d', c):
+                    qty_str = c
+                    break
+        else:
+            match = re.search(r'(\d+)\s*$', line)
+            if match:
+                qty_str = match.group(1)
+                name = line[:match.start()].strip()
+
+        if not name:
+            continue
+
+        qty_val = int(re.sub(r'[^0-9]', '', str(qty_str)) or 0)
+        if qty_val <= 0:
+            continue
+
+        raw_name = str(name).strip()
+        name_parts = [n.strip() for n in raw_name.split(',') if n.strip()]
+        if not name_parts:
+            continue
+
+        if len(name_parts) == 1:
+            final_name = identify_product(name_parts[0]) if normalize else name_parts[0]
+            parsed.append({'상품명': final_name, '수량': qty_val})
+        else:
+            # Split total quantity across items (e.g., 4 items with qty 4 -> 1 each)
+            base_qty = qty_val // len(name_parts)
+            remainder = qty_val % len(name_parts)
+            for idx, part in enumerate(name_parts):
+                part_qty = base_qty + (1 if idx < remainder else 0)
+                if part_qty <= 0:
+                    continue
+                final_name = identify_product(part) if normalize else part
+                parsed.append({'상품명': final_name, '수량': part_qty})
+
+    if not parsed:
+        return pd.DataFrame(columns=['상품명', '수량']), 0
+
+    df = pd.DataFrame(parsed)
+    summary = df.groupby('상품명')['수량'].sum().reset_index()
+    total_qty = int(summary['수량'].sum())
+    return summary, total_qty
 
 def process_data(file_name, content):
     market_key = 'unknown'
@@ -413,7 +498,7 @@ with st.expander("📖 사용법", expanded=False):
     
     ### 📋 주문관리 시트 생성
     **파일 준비**
-    - **CJ택배 파일**: CJ 배송 실적 출력 파일 (운송장번호와 고객주문번호 포함)
+    - **CJ택배 파일**: CJ 배송 실적 출력 파일 (운송장번호와 고객주문번호 포함, 여러 파일 가능)
     - **마켓 주문 파일**: 각 마켓의 주문 내역 파일 (위에서 업로드한 파일 재사용 가능)
     
     **사용 순서**
@@ -434,6 +519,16 @@ with st.expander("📖 사용법", expanded=False):
     - ✅ 옥션/지마켓 자동 구분 (주문번호 패턴 분석)
     - ✅ 제품명 자동 분류 (OH, PH, SH, 케이블, 거치대, 번호판 등 9종)
     - ✅ 쿠팡 발송 파일 자동 생성 (원본 서식 유지, 운송장번호 추가)
+
+     ---
+
+     ### 📊 품목별 판매 집계
+     1. 상품명/수량을 복사해서 붙여넣기
+         - 탭/콤마 구분 자동 인식
+
+     2. 집계 옵션 선택
+         - 상품명 자동 분류 적용: OH/PH/SH, 케이블(일반), 케이블s 등으로 분류
+         - 붙여넣기 즉시 자동 집계: 해제 시 "집계하기" 버튼으로 실행
     
     ---
     
@@ -600,11 +695,12 @@ if 'order_mgmt_info' not in st.session_state:
 col_a, col_b = st.columns(2)
 
 with col_a:
-    cj_file = st.file_uploader(
+    cj_files = st.file_uploader(
         "CJ택배 출력 파일 업로드",
         type=['xlsx', 'xls', 'csv'],
         key="cj_upload",
-        help="운송장번호와 고객주문번호가 포함된 CJ택배 출력 파일"
+        help="운송장번호와 고객주문번호가 포함된 CJ택배 출력 파일",
+        accept_multiple_files=True
     )
 
 with col_b:
@@ -631,7 +727,7 @@ with col_b:
         market_files = None
 
 if st.button("🔗 주문관리시트 생성", type="primary", key="gen_order_mgmt"):
-    if not cj_file:
+    if not cj_files:
         st.error("CJ택배 파일을 업로드해주세요")
     elif not use_existing and not market_files:
         st.error("마켓 주문시트를 업로드하거나 위의 파일을 사용하도록 체크해주세요")
@@ -639,10 +735,19 @@ if st.button("🔗 주문관리시트 생성", type="primary", key="gen_order_mg
         with st.spinner("주문관리시트 생성 중..."):
             try:
                 # CJ택배 파일 읽기
-                cj_content = cj_file.read()
-                cj_df = pd.read_csv(io.BytesIO(cj_content)) if cj_file.name.endswith('.csv') \
-                    else pd.read_excel(io.BytesIO(cj_content))
-                cj_df.columns = cj_df.columns.astype(str).str.strip()
+                cj_dfs = []
+                for cj_file in cj_files:
+                    cj_content = cj_file.read()
+                    cj_df = pd.read_csv(io.BytesIO(cj_content)) if cj_file.name.endswith('.csv') \
+                        else pd.read_excel(io.BytesIO(cj_content))
+                    cj_df.columns = cj_df.columns.astype(str).str.strip()
+                    cj_dfs.append(cj_df)
+
+                if not cj_dfs:
+                    st.error("CJ택배 파일을 업로드해주세요")
+                    st.stop()
+
+                cj_df = pd.concat(cj_dfs, ignore_index=True)
                 
                 # 운송장번호와 고객주문번호 매핑
                 invoice_map = {}
@@ -737,6 +842,7 @@ if st.button("🔗 주문관리시트 생성", type="primary", key="gen_order_mg
                                 '채널': channel_name,
                                 '주문번호': order_no,
                                 '상품명': identify_product(row.get('상품명', '')),
+                                '상품명_원문': str(row.get('상품명', '')).strip(),
                                 '수량': row.get('수량', ''),
                                 '주문인': row.get(buyer_col, '') if buyer_col else '',
                                 '수취인': row.get('수취인명', ''),
@@ -758,6 +864,7 @@ if st.button("🔗 주문관리시트 생성", type="primary", key="gen_order_mg
                                 '채널': channel_name,
                                 '주문번호': order_no,
                                 '상품명': identify_product(row.get('등록상품명', '')),
+                                '상품명_원문': str(row.get('등록상품명', '')).strip(),
                                 '수량': row.get('구매수(수량)', ''),
                                 '주문인': row.get(buyer_col, '') if buyer_col else '',
                                 '수취인': row.get('수취인이름', ''),
@@ -791,6 +898,7 @@ if st.button("🔗 주문관리시트 생성", type="primary", key="gen_order_mg
                                 '채널': actual_channel,
                                 '주문번호': order_no,
                                 '상품명': identify_product(row.get('상품명', '')),
+                                '상품명_원문': str(row.get('상품명', '')).strip(),
                                 '수량': row.get('수량', ''),
                                 '주문인': row.get(buyer_col, '') if buyer_col else '',
                                 '수취인': row.get('수령인명', ''),
@@ -814,6 +922,7 @@ if st.button("🔗 주문관리시트 생성", type="primary", key="gen_order_mg
                                 '채널': channel_name,
                                 '주문번호': order_no,
                                 '상품명': identify_product(row.get('상품명', '')),
+                                '상품명_원문': str(row.get('상품명', '')).strip(),
                                 '수량': row.get('수량', ''),
                                 '주문인': row.get(buyer_col, '') if buyer_col else '',
                                 '수취인': row.get(name_col, '') if name_col else '',
@@ -835,6 +944,7 @@ if st.button("🔗 주문관리시트 생성", type="primary", key="gen_order_mg
                                 '채널': channel_name,
                                 '주문번호': order_no,
                                 '상품명': identify_product(row.get('주문상품명', '')),
+                                '상품명_원문': str(row.get('주문상품명', '')).strip(),
                                 '수량': row.get('수량', ''),
                                 '주문인': row.get(buyer_col, '') if buyer_col else '',
                                 '수취인': row.get('수령인', ''),
@@ -854,6 +964,7 @@ if st.button("🔗 주문관리시트 생성", type="primary", key="gen_order_mg
                                 '채널': channel_name,
                                 '주문번호': order_no,
                                 '상품명': identify_product(row.get('주문 상품', '')),
+                                '상품명_원문': str(row.get('주문 상품', '')).strip(),
                                 '수량': row.get('주문 수량', ''),
                                 '주문인': row.get(buyer_col, '') if buyer_col else '',
                                 '수취인': row.get('받는 분', ''),
@@ -1035,7 +1146,18 @@ if st.session_state.order_mgmt_file:
     if st.session_state.order_mgmt_raw_data:
         with st.expander("📈 품목별 판매 집계", expanded=False):
             raw_df = pd.DataFrame(st.session_state.order_mgmt_raw_data)
-            product_summary = raw_df.groupby('상품명')['수량'].sum().reset_index()
+            use_normalized = st.checkbox(
+                "상품명 자동 분류 적용 (OH/PH/SH 등)",
+                value=False,
+                key="mgmt_summary_normalize",
+                help="체크하면 상품명을 OH/PH/SH, 케이블 등으로 자동 분류해 집계합니다"
+            )
+
+            summary_col = '상품명' if use_normalized else '상품명_원문'
+            if summary_col not in raw_df.columns:
+                summary_col = '상품명'
+
+            product_summary = raw_df.groupby(summary_col)['수량'].sum().reset_index()
             product_summary.columns = ['품목', '판매 수량']
             
             # 품목 순서 정의
@@ -1053,7 +1175,7 @@ if st.session_state.order_mgmt_file:
             
             # 정렬키 추가
             product_summary['순서'] = product_summary['품목'].map(lambda x: product_order.get(x, 99))
-            product_summary = product_summary.sort_values(by='순서')
+            product_summary = product_summary.sort_values(by=['순서', '품목'])
             product_summary = product_summary[['품목', '판매 수량']]
             
             st.dataframe(product_summary, use_container_width=True, hide_index=True)
@@ -1066,6 +1188,66 @@ if st.session_state.order_mgmt_file:
         st.session_state.order_mgmt_raw_data = None
         st.session_state.coupang_delivery_file = None
         st.rerun()
+
+st.markdown("---")
+st.markdown("## 📊 품목별 판매 집계 (복붙 입력)")
+st.markdown("오전/오후 발주 후 시트에서 상품명과 수량을 복사해 붙여넣으면 품목별/하루 총 판매량을 집계합니다.")
+
+toggle_col1, toggle_col2, _ = st.columns([1, 1, 2])
+with toggle_col1:
+    normalize_names = st.checkbox(
+        "상품명 자동 분류 적용 (OH/PH/SH 등)",
+        value=True,
+        help="상품명을 OH/PH/SH, 케이블, 거치대 등으로 자동 분류합니다"
+    )
+
+with toggle_col2:
+    auto_calc = st.checkbox(
+        "붙여넣기 즉시 자동 집계",
+        value=True,
+        help="체크 해제 시 '집계하기' 버튼을 눌러야 집계됩니다"
+    )
+
+if 'paste_summary_ready' not in st.session_state:
+    st.session_state.paste_summary_ready = False
+
+def _mark_paste_ready():
+    st.session_state.paste_summary_ready = True
+
+pasted_text = st.text_area(
+    "상품명과 수량을 붙여넣기",
+    placeholder="예)\n상품명\t수량\nOH\t2\nPH\t1\n케이블\t3",
+    height=160,
+    on_change=_mark_paste_ready if auto_calc else None,
+    key="paste_input"
+)
+
+col_calc, _ = st.columns([1, 3])
+with col_calc:
+    if st.button("집계하기", type="primary"):
+        st.session_state.paste_summary_ready = True
+
+if st.session_state.paste_summary_ready and pasted_text.strip():
+    summary_df, total_qty = parse_pasted_sales(pasted_text, normalize=normalize_names)
+    if summary_df.empty:
+        st.warning("집계할 데이터가 없습니다. 붙여넣은 내용을 확인해주세요.")
+    else:
+        product_order = {
+            'OH': 0,
+            'PH': 1,
+            'SH': 2,
+            '케이블(일반)': 3,
+            '케이블s': 4,
+            '휴대폰거치대': 5,
+            '차량번호판': 6,
+            '차량용망치': 7,
+            '도막측정기': 8
+        }
+        summary_df['순서'] = summary_df['상품명'].map(lambda x: product_order.get(x, 99))
+        summary_df = summary_df.sort_values(by=['순서', '상품명']).drop(columns=['순서'])
+        summary_df.columns = ['품목', '판매 수량']
+        st.dataframe(summary_df, use_container_width=True, hide_index=True)
+        st.info(f"하루 총 판매 수량: {total_qty}개")
 
 # Footer
 st.markdown("---")
