@@ -35,13 +35,15 @@ def identify_product(name):
     name_upper = name_str.upper()
     name_lower = name_str.lower()
     
-    # OH, PH, SH 우선 확인
-    if 'OH' in name_upper: return 'OH'
-    if 'PH' in name_upper: return 'PH'
-    if 'SH' in name_upper: return 'SH'
+    # 리퍼 제품 여부 확인 (_Re 표기 또는 한글 '리퍼'/'리퍼제품')
+    is_refurb = '_RE' in name_upper or '리퍼' in name_str
+
+    # IH, OH, PH, SH 코드 우선 확인 (리퍼면 _Re 접미사 부착)
+    for code in ('IH', 'OH', 'PH', 'SH'):
+        if code in name_upper:
+            return f"{code}_Re" if is_refurb else code
     
     # 기타 제품 매핑
-    name_lower = name_str.lower()
     if '케이블s' in name_lower:
         return '케이블s'
     if '케이블' in name_str:
@@ -57,8 +59,22 @@ def identify_product(name):
         return '차량용망치'
     if '도막' in name_str or '측정기' in name_str:
         return '도막측정기'
-    
+
     return name
+
+# 판매자/업체 상품코드(예: 'PH', 'SH_Re')를 표준 품목명으로 정규화
+# 네이버 '판매자 상품코드', 쿠팡 '업체상품코드'처럼 코드가 명시된 컬럼을 우선 신뢰한다.
+_CODE_RE = re.compile(r'^(IH|OH|PH|SH)(?:[ _\-]?(RE))?$')
+def code_to_item(raw):
+    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    m = _CODE_RE.match(s.upper())
+    if not m:
+        return None
+    return f"{m.group(1)}_Re" if m.group(2) else m.group(1)
 
 def get_message(row, cols):
     for col in cols:
@@ -348,7 +364,7 @@ def process_data(file_name, content):
                 '받는분전화번호': df['수취인연락처1'].apply(clean_phone),
                 '받는분주소': df['통합배송지'],
                 '배송메세지': df['final_msg'],
-                '품목': df['상품명'].apply(identify_product),
+                '품목': df.apply(lambda r: code_to_item(r.get('판매자 상품코드')) or identify_product(r.get('상품명', '')), axis=1),
                 '수량': df['수량'],
                 '내부정렬키': df['상품명'].astype(str)
             })
@@ -360,7 +376,7 @@ def process_data(file_name, content):
                 '받는분전화번호': df['수취인전화번호'].apply(clean_phone),
                 '받는분주소': df['수취인 주소'],
                 '배송메세지': df['final_msg'],
-                '품목': df['등록상품명'].apply(identify_product),
+                '품목': df.apply(lambda r: code_to_item(r.get('업체상품코드')) or identify_product(r.get('등록상품명', '')), axis=1),
                 '수량': df['구매수(수량)'],
                 '내부정렬키': df['업체상품코드'].astype(str)
             })
@@ -428,8 +444,8 @@ def process_data(file_name, content):
 def consolidate(group):
     prod_counts = group.groupby('품목')['수량'].sum().reset_index()
     def sort_key(item):
-        order = {'OH': 0, 'PH': 1, 'SH': 2}
-        return (order.get(str(item).upper(), 3), str(item))
+        order = {'IH_RE': 0, 'OH': 1, 'OH_RE': 2, 'PH': 3, 'PH_RE': 4, 'SH': 5, 'SH_RE': 6}
+        return (order.get(str(item).upper(), 7), str(item))
 
     formatted = [f"{row['품목']} {int(row['수량'])}개" if row['수량'] > 1 else str(row['품목']) 
                  for _, row in prod_counts.iterrows()]
@@ -517,7 +533,7 @@ with st.expander("📖 사용법", expanded=False):
     - ✅ CJ 고객주문번호와 매칭되는 송장번호 자동 입력
     - ✅ 발주파일과 동일한 순서로 자동 정렬 (마켓별 → 제품별)
     - ✅ 옥션/지마켓 자동 구분 (주문번호 패턴 분석)
-    - ✅ 제품명 자동 분류 (OH, PH, SH, 케이블, 거치대, 번호판 등 9종)
+    - ✅ 제품명 자동 분류 (IH_Re, OH, OH_Re, PH, PH_Re, SH, SH_Re, 케이블, 거치대, 번호판 등)
     - ✅ 쿠팡 발송 파일 자동 생성 (원본 서식 유지, 운송장번호 추가)
 
      ---
@@ -539,11 +555,14 @@ with st.expander("📖 사용법", expanded=False):
     - 자사몰 (orders)
     - ESM (지마켓/옥션 - 신규주문)
     - 11번가 (allList)
+
+    ### 📦 지원 상품
+    - 기존 제품과 `_Re` 리퍼 제품을 각각 별도 품목으로 처리
     
     ### 💡 참고사항
     - 파일명 시간 형식: MMDD_HH (예: 0206_15 = 2월 6일 오후 3시)
     - 동일한 배송지로 여러 상품 주문 시 자동 통합
-    - 정렬 순서: 네이버→쿠팡→자사몰→ESM→11번가→와디즈 / OH→PH→SH→기타
+    - 정렬 순서: 네이버→쿠팡→자사몰→ESM→11번가→와디즈 / IH_Re→OH→OH_Re→PH→PH_Re→SH→SH_Re→기타
     """)
 
 st.markdown("### 📂 파일 업로드")
@@ -841,7 +860,7 @@ if st.button("🔗 주문관리시트 생성", type="primary", key="gen_order_mg
                                 '날짜': today_str,
                                 '채널': channel_name,
                                 '주문번호': order_no,
-                                '상품명': identify_product(row.get('상품명', '')),
+                                '상품명': code_to_item(row.get('판매자 상품코드')) or identify_product(row.get('상품명', '')),
                                 '상품명_원문': str(row.get('상품명', '')).strip(),
                                 '수량': row.get('수량', ''),
                                 '주문인': row.get(buyer_col, '') if buyer_col else '',
@@ -863,7 +882,7 @@ if st.button("🔗 주문관리시트 생성", type="primary", key="gen_order_mg
                                 '날짜': today_str,
                                 '채널': channel_name,
                                 '주문번호': order_no,
-                                '상품명': identify_product(row.get('등록상품명', '')),
+                                '상품명': code_to_item(row.get('업체상품코드')) or identify_product(row.get('등록상품명', '')),
                                 '상품명_원문': str(row.get('등록상품명', '')).strip(),
                                 '수량': row.get('구매수(수량)', ''),
                                 '주문인': row.get(buyer_col, '') if buyer_col else '',
@@ -992,17 +1011,11 @@ if st.button("🔗 주문관리시트 생성", type="primary", key="gen_order_mg
                             else:
                                 prod_counts[prod] = qty
                         
-                        # OH, PH, SH 순서로 정렬
+                        # IH_Re, OH, OH_Re, PH, PH_Re, SH, SH_Re 순서로 정렬
                         def get_sort_priority(prod_name):
                             prod_upper = str(prod_name).strip().upper()
-                            if prod_upper == 'OH':
-                                return (0, prod_name)
-                            elif prod_upper == 'PH':
-                                return (1, prod_name)
-                            elif prod_upper == 'SH':
-                                return (2, prod_name)
-                            else:
-                                return (3, prod_name)
+                            order = {'IH_RE': 0, 'OH': 1, 'OH_RE': 2, 'PH': 3, 'PH_RE': 4, 'SH': 5, 'SH_RE': 6}
+                            return (order.get(prod_upper, 7), prod_name)
                         
                         sorted_prods = sorted(prod_counts.items(), key=lambda x: get_sort_priority(x[0]))
                         
@@ -1162,15 +1175,19 @@ if st.session_state.order_mgmt_file:
             
             # 품목 순서 정의
             product_order = {
-                'OH': 0,
-                'PH': 1,
-                'SH': 2,
-                '케이블(일반)': 3,
-                '케이블s': 4,
-                '휴대폰거치대': 5,
-                '차량번호판': 6,
-                '차량용망치': 7,
-                '도막측정기': 8
+                'IH_Re': 0,
+                'OH': 1,
+                'OH_Re': 2,
+                'PH': 3,
+                'PH_Re': 4,
+                'SH': 5,
+                'SH_Re': 6,
+                '케이블(일반)': 7,
+                '케이블s': 8,
+                '휴대폰거치대': 9,
+                '차량번호판': 10,
+                '차량용망치': 11,
+                '도막측정기': 12
             }
             
             # 정렬키 추가
@@ -1233,15 +1250,19 @@ if st.session_state.paste_summary_ready and pasted_text.strip():
         st.warning("집계할 데이터가 없습니다. 붙여넣은 내용을 확인해주세요.")
     else:
         product_order = {
-            'OH': 0,
-            'PH': 1,
-            'SH': 2,
-            '케이블(일반)': 3,
-            '케이블s': 4,
-            '휴대폰거치대': 5,
-            '차량번호판': 6,
-            '차량용망치': 7,
-            '도막측정기': 8
+            'IH_Re': 0,
+            'OH': 1,
+            'OH_Re': 2,
+            'PH': 3,
+            'PH_Re': 4,
+            'SH': 5,
+            'SH_Re': 6,
+            '케이블(일반)': 7,
+            '케이블s': 8,
+            '휴대폰거치대': 9,
+            '차량번호판': 10,
+            '차량용망치': 11,
+            '도막측정기': 12
         }
         summary_df['순서'] = summary_df['상품명'].map(lambda x: product_order.get(x, 99))
         summary_df = summary_df.sort_values(by=['순서', '상품명']).drop(columns=['순서'])
