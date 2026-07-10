@@ -3,7 +3,9 @@ import pandas as pd
 import re
 import io
 import openpyxl
+from copy import copy
 from datetime import datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 # 페이지 설정
@@ -26,9 +28,39 @@ MARKET_CONFIG = {
     'wadiz': {'key': '발송 처리용 주문', 'skip': 0, 'order': 6}
 }
 
+NAVER_DELIVERY_TEMPLATE_NAME = "네이버_엑셀발송_양식.xls"
+NAVER_DELIVERY_COLUMNS = ['상품주문번호', '배송방법', '택배사', '송장번호']
+NAVER_DELIVERY_COLUMN_ALIASES = {
+    '상품주문번호': ['상품주문번호'],
+    '배송방법': ['배송방법', '배송 방법'],
+    '택배사': ['택배사', '택배사명'],
+    '송장번호': ['송장번호', '운송장번호']
+}
+NAVER_DELIVERY_METHOD = "택배,등기,소포"
+NAVER_DELIVERY_COMPANY = "CJ대한통운"
+
+def find_naver_delivery_template():
+    for path in (
+        Path("sample_data") / NAVER_DELIVERY_TEMPLATE_NAME,
+        Path(NAVER_DELIVERY_TEMPLATE_NAME),
+    ):
+        if path.exists():
+            return path
+    return None
+
 def clean_phone(phone):
     if pd.isna(phone): return ""
     return re.sub(r'[^0-9]', '', str(phone))
+
+def normalize_excel_id(value):
+    if pd.isna(value):
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    text = str(value).strip()
+    if re.fullmatch(r'\d+\.0', text):
+        return text[:-2]
+    return text
 
 def identify_product(name):
     name_str = str(name)
@@ -182,6 +214,144 @@ def apply_text_format_to_excel_bytes(file_bytes, target_cols=None, keyword_cols=
     except Exception:
         return file_bytes
 
+def _read_tabular_file(file_content, file_name, skiprows=0):
+    name = file_name.lower()
+    if name.endswith('.csv'):
+        return pd.read_csv(io.BytesIO(file_content), skiprows=skiprows)
+    return pd.read_excel(io.BytesIO(file_content), skiprows=skiprows)
+
+def _read_naver_order_df(file_content, file_name):
+    for skiprows in (MARKET_CONFIG['naver']['skip'], 0):
+        try:
+            df = _read_tabular_file(file_content, file_name, skiprows=skiprows)
+            df.columns = df.columns.astype(str).str.strip()
+            if '상품주문번호' in df.columns:
+                return df
+        except Exception:
+            continue
+    return None
+
+def _find_header_row(ws, required_header):
+    for row_idx in range(1, min(ws.max_row, 20) + 1):
+        values = [cell.value for cell in ws[row_idx]]
+        if required_header in values:
+            return row_idx, values
+    return 1, [cell.value for cell in ws[1]]
+
+def _ensure_columns(ws, header_row_idx, header, columns):
+    header = list(header)
+    for col_name in columns:
+        if col_name not in header:
+            header.append(col_name)
+            ws.cell(row=header_row_idx, column=len(header), value=col_name)
+    return header
+
+def _find_naver_delivery_header(header, canonical_name):
+    for alias in NAVER_DELIVERY_COLUMN_ALIASES[canonical_name]:
+        if alias in header:
+            return alias
+    return None
+
+def _ensure_naver_delivery_columns(ws, header_row_idx, header):
+    header = list(header)
+    for col_name in NAVER_DELIVERY_COLUMNS:
+        if _find_naver_delivery_header(header, col_name) is None:
+            header.append(col_name)
+            ws.cell(row=header_row_idx, column=len(header), value=col_name)
+    return header
+
+def _read_template_header(template_content, template_name):
+    if not template_content or not template_name:
+        return None
+    try:
+        preview = pd.read_excel(io.BytesIO(template_content), header=None, nrows=20)
+        for _, row in preview.iterrows():
+            values = [str(value).strip() if pd.notna(value) else None for value in row.tolist()]
+            if '상품주문번호' in values:
+                while values and values[-1] is None:
+                    values.pop()
+                return values
+    except Exception:
+        return None
+    return None
+
+def _write_naver_delivery_xlsx(rows, template_content=None, template_name=None):
+    template_is_xlsx = template_content and template_name and template_name.lower().endswith('.xlsx')
+
+    if template_is_xlsx:
+        wb = openpyxl.load_workbook(io.BytesIO(template_content))
+        ws = wb.active
+        header_row_idx, header = _find_header_row(ws, '상품주문번호')
+        header = _ensure_naver_delivery_columns(ws, header_row_idx, header)
+    else:
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        header_row_idx = 1
+        header = _read_template_header(template_content, template_name) or list(NAVER_DELIVERY_COLUMNS)
+        header = _ensure_naver_delivery_columns(ws, header_row_idx, header)
+        for col_idx, col_name in enumerate(header, start=1):
+            ws.cell(row=header_row_idx, column=col_idx, value=col_name)
+
+    style_row_idx = header_row_idx + 1 if ws.max_row > header_row_idx else None
+    style_by_col = {}
+    if style_row_idx:
+        for col_idx in range(1, len(header) + 1):
+            style_by_col[col_idx] = copy(ws.cell(row=style_row_idx, column=col_idx)._style)
+
+    if ws.max_row > header_row_idx:
+        ws.delete_rows(header_row_idx + 1, ws.max_row - header_row_idx)
+
+    column_indexes = {
+        col_name: header.index(_find_naver_delivery_header(header, col_name)) + 1
+        for col_name in NAVER_DELIVERY_COLUMNS
+    }
+    for row_offset, row_data in enumerate(rows, start=1):
+        row_idx = header_row_idx + row_offset
+        for col_name in NAVER_DELIVERY_COLUMNS:
+            col_idx = column_indexes[col_name]
+            cell = ws.cell(row=row_idx, column=col_idx, value=row_data[col_name])
+            if col_idx in style_by_col:
+                cell._style = copy(style_by_col[col_idx])
+            if col_name in ('상품주문번호', '송장번호'):
+                cell.number_format = '@'
+
+    output = io.BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return output.getvalue()
+
+def create_naver_delivery_file(file_content, file_name, invoice_map, template_content=None, template_name=None):
+    df = _read_naver_order_df(file_content, file_name)
+    if df is None or df.empty:
+        return None
+
+    product_order_col = '상품주문번호'
+    order_col = pick_first_col(df.columns, ['주문번호', '고객주문번호'])
+
+    rows = []
+    for _, row in df.iterrows():
+        product_order_no = normalize_excel_id(row.get(product_order_col))
+        if not product_order_no or product_order_no.lower() == 'nan':
+            continue
+
+        order_no = normalize_excel_id(row.get(order_col)) if order_col else ""
+        invoice = invoice_map.get(product_order_no) or invoice_map.get(order_no, "")
+        rows.append({
+            '상품주문번호': product_order_no,
+            '배송방법': NAVER_DELIVERY_METHOD,
+            '택배사': NAVER_DELIVERY_COMPANY,
+            '송장번호': invoice
+        })
+
+    if not rows:
+        return None
+
+    return _write_naver_delivery_xlsx(
+        rows,
+        template_content=template_content,
+        template_name=template_name
+    )
+
 def add_invoice_to_coupang(file_content, file_name, invoice_map):
     """쿠팡 파일에 운송장번호 추가 (서식 유지)"""
     try:
@@ -205,7 +375,7 @@ def add_invoice_to_coupang(file_content, file_name, invoice_map):
         
         # 데이터 행에 운송장번호 추가
         for row_idx in range(2, ws.max_row + 1):
-            order_no = str(ws.cell(row=row_idx, column=order_col_idx).value)
+            order_no = normalize_excel_id(ws.cell(row=row_idx, column=order_col_idx).value)
             invoice = invoice_map.get(order_no, '')
             
             cell = ws.cell(row=row_idx, column=invoice_col_idx)
@@ -491,6 +661,8 @@ if 'order_mgmt_raw_data' not in st.session_state:
     st.session_state.order_mgmt_raw_data = None
 if 'coupang_delivery_file' not in st.session_state:
     st.session_state.coupang_delivery_file = None
+if 'naver_delivery_file' not in st.session_state:
+    st.session_state.naver_delivery_file = None
 if 'uploaded_market_files' not in st.session_state:
     st.session_state.uploaded_market_files = None
 
@@ -526,6 +698,7 @@ with st.expander("📖 사용법", expanded=False):
     5. 생성된 파일을 다운로드하세요
        - `주문관리_MMDD_HH.xlsx`: 송장번호 매칭된 통합 주문 관리 시트
        - `쿠팡발송_MMDD_HH.xlsx`: 쿠팡 발송용 파일 (원본 서식 유지 + 운송장번호)
+       - `네이버발송_MMDD_HH.xlsx`: 네이버 엑셀발송용 파일 (상품주문번호 + CJ 송장번호)
     6. 데이터 미리보기와 품목별 판매 집계를 확인하세요
     
     **자동 기능**
@@ -535,6 +708,7 @@ with st.expander("📖 사용법", expanded=False):
     - ✅ 옥션/지마켓 자동 구분 (주문번호 패턴 분석)
     - ✅ 제품명 자동 분류 (IH_Re, OH, OH_Re, PH, PH_Re, SH, SH_Re, 케이블, 거치대, 번호판 등)
     - ✅ 쿠팡 발송 파일 자동 생성 (원본 서식 유지, 운송장번호 추가)
+    - ✅ 네이버 엑셀발송 파일 자동 생성 (배송방법: 택배,등기,소포 / 택배사: CJ대한통운)
 
      ---
 
@@ -710,6 +884,8 @@ if 'order_mgmt_file' not in st.session_state:
     st.session_state.order_mgmt_file = None
 if 'order_mgmt_info' not in st.session_state:
     st.session_state.order_mgmt_info = None
+if 'naver_delivery_file' not in st.session_state:
+    st.session_state.naver_delivery_file = None
 
 col_a, col_b = st.columns(2)
 
@@ -745,6 +921,13 @@ with col_b:
                 st.write(f"- {file_name}")
         market_files = None
 
+naver_template_file = st.file_uploader(
+    "네이버 엑셀발송 양식 업로드 (선택)",
+    type=['xlsx', 'xls'],
+    key="naver_template_upload",
+    help=f"업로드하지 않으면 sample_data/{NAVER_DELIVERY_TEMPLATE_NAME} 규격을 자동으로 사용합니다."
+)
+
 if st.button("🔗 주문관리시트 생성", type="primary", key="gen_order_mgmt"):
     if not cj_files:
         st.error("CJ택배 파일을 업로드해주세요")
@@ -772,8 +955,8 @@ if st.button("🔗 주문관리시트 생성", type="primary", key="gen_order_mg
                 invoice_map = {}
                 if '운송장번호' in cj_df.columns and '고객주문번호' in cj_df.columns:
                     for _, row in cj_df.iterrows():
-                        order_no = str(row['고객주문번호']).strip()
-                        invoice = str(row['운송장번호']).strip()
+                        order_no = normalize_excel_id(row['고객주문번호'])
+                        invoice = normalize_excel_id(row['운송장번호'])
                         if order_no and invoice and invoice != 'nan':
                             invoice_map[order_no] = invoice
                 
@@ -855,7 +1038,7 @@ if st.button("🔗 주문관리시트 생성", type="primary", key="gen_order_mg
                         df['final_msg'] = df.apply(lambda r: get_message(r, ['배송메세지', '비고']), axis=1)
                         
                         for _, row in df.iterrows():
-                            order_no = str(row['주문번호']).strip()
+                            order_no = normalize_excel_id(row['주문번호'])
                             all_orders.append({
                                 '날짜': today_str,
                                 '채널': channel_name,
@@ -877,7 +1060,7 @@ if st.button("🔗 주문관리시트 생성", type="primary", key="gen_order_mg
                         df['final_msg'] = df.apply(lambda r: get_message(r, ['배송메세지', '비고']), axis=1)
                         
                         for _, row in df.iterrows():
-                            order_no = str(row['주문번호']).strip()
+                            order_no = normalize_excel_id(row['주문번호'])
                             all_orders.append({
                                 '날짜': today_str,
                                 '채널': channel_name,
@@ -899,7 +1082,7 @@ if st.button("🔗 주문관리시트 생성", type="primary", key="gen_order_mg
                         df['final_msg'] = df.apply(lambda r: get_message(r, ['배송시 요구사항', '배송메세지', '비고']), axis=1)
                         
                         for _, row in df.iterrows():
-                            order_no = str(row['주문번호']).strip()
+                            order_no = normalize_excel_id(row['주문번호'])
                             
                             # 주문번호 패턴으로 옥션/지마켓 구분
                             if len(order_no) == 10:
@@ -935,7 +1118,7 @@ if st.button("🔗 주문관리시트 생성", type="primary", key="gen_order_mg
                         df['final_msg'] = df.apply(lambda r: get_message(r, ['배송메시지', '배송메세지', '비고']), axis=1)
                         
                         for _, row in df.iterrows():
-                            order_no = str(row['주문번호']).strip()
+                            order_no = normalize_excel_id(row['주문번호'])
                             all_orders.append({
                                 '날짜': today_str,
                                 '채널': channel_name,
@@ -957,7 +1140,7 @@ if st.button("🔗 주문관리시트 생성", type="primary", key="gen_order_mg
                         df['final_msg'] = df.apply(lambda r: get_message(r, ['비고', '배송메세지']), axis=1)
                         
                         for _, row in df.iterrows():
-                            order_no = str(row['주문번호']).strip()
+                            order_no = normalize_excel_id(row['주문번호'])
                             all_orders.append({
                                 '날짜': today_str,
                                 '채널': channel_name,
@@ -977,7 +1160,7 @@ if st.button("🔗 주문관리시트 생성", type="primary", key="gen_order_mg
                         df['final_msg'] = df.apply(lambda r: get_message(r, ['배송 요청 사항', '주문 요청 사항']), axis=1)
 
                         for _, row in df.iterrows():
-                            order_no = str(row.get('주문 번호', '')).strip()
+                            order_no = normalize_excel_id(row.get('주문 번호', ''))
                             all_orders.append({
                                 '날짜': today_str,
                                 '채널': channel_name,
@@ -1067,29 +1250,40 @@ if st.button("🔗 주문관리시트 생성", type="primary", key="gen_order_mg
                     
                     # 쿠팡 발송 파일 생성
                     coupang_delivery = None
-                    if use_existing and st.session_state.uploaded_market_files:
-                        # 업로드된 파일에서 쿠팡 파일 찾기
-                        for file_name, content in st.session_state.uploaded_market_files:
-                            if 'DeliveryList' in file_name:
-                                coupang_delivery = add_invoice_to_coupang(content, file_name, invoice_map)
-                                if coupang_delivery:
-                                    coupang_delivery = apply_text_format_to_excel_bytes(
-                                        coupang_delivery,
-                                        keyword_cols=['전화', '연락처', '휴대폰']
-                                    )
-                                break
-                    elif market_files:
-                        # 새로 업로드한 파일에서 쿠팡 파일 찾기
-                        for f in market_files:
-                            if 'DeliveryList' in f.name:
-                                content = f.read()
-                                coupang_delivery = add_invoice_to_coupang(content, f.name, invoice_map)
-                                if coupang_delivery:
-                                    coupang_delivery = apply_text_format_to_excel_bytes(
-                                        coupang_delivery,
-                                        keyword_cols=['전화', '연락처', '휴대폰']
-                                    )
-                                break
+                    for file_name, content in files_to_process:
+                        if 'DeliveryList' in file_name:
+                            coupang_delivery = add_invoice_to_coupang(content, file_name, invoice_map)
+                            if coupang_delivery:
+                                coupang_delivery = apply_text_format_to_excel_bytes(
+                                    coupang_delivery,
+                                    keyword_cols=['전화', '연락처', '휴대폰']
+                                )
+                            break
+
+                    # 네이버 엑셀발송 파일 생성
+                    naver_delivery = None
+                    naver_template_content = None
+                    naver_template_name = None
+
+                    if naver_template_file:
+                        naver_template_content = naver_template_file.read()
+                        naver_template_name = naver_template_file.name
+                    else:
+                        local_template = find_naver_delivery_template()
+                        if local_template:
+                            naver_template_content = local_template.read_bytes()
+                            naver_template_name = local_template.name
+
+                    for file_name, content in files_to_process:
+                        naver_delivery = create_naver_delivery_file(
+                            content,
+                            file_name,
+                            invoice_map,
+                            template_content=naver_template_content,
+                            template_name=naver_template_name
+                        )
+                        if naver_delivery:
+                            break
                     
                     # 엑셀 파일 생성
                     output = io.BytesIO()
@@ -1113,6 +1307,7 @@ if st.button("🔗 주문관리시트 생성", type="primary", key="gen_order_mg
                     st.session_state.order_mgmt_preview = consolidated
                     st.session_state.order_mgmt_raw_data = all_orders
                     st.session_state.coupang_delivery_file = coupang_delivery
+                    st.session_state.naver_delivery_file = naver_delivery
                     
                     st.success("✅ 주문관리시트 생성 완료!")
                     st.rerun()
@@ -1126,7 +1321,7 @@ if st.button("🔗 주문관리시트 생성", type="primary", key="gen_order_mg
 if st.session_state.order_mgmt_file:
     st.markdown("### 📥 주문관리시트 다운로드")
     
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     
     with col1:
         st.download_button(
@@ -1145,6 +1340,18 @@ if st.session_state.order_mgmt_file:
                 label="📦 쿠팡 발송 파일 다운로드",
                 data=st.session_state.coupang_delivery_file,
                 file_name=coupang_filename,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
+
+    if st.session_state.naver_delivery_file:
+        with col3:
+            now = datetime.now(ZoneInfo("Asia/Seoul"))
+            naver_filename = f"네이버발송_{now.strftime('%m%d_%H')}.xlsx"
+            st.download_button(
+                label="📦 네이버 발송 파일 다운로드",
+                data=st.session_state.naver_delivery_file,
+                file_name=naver_filename,
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True
             )
@@ -1204,6 +1411,7 @@ if st.session_state.order_mgmt_file:
         st.session_state.order_mgmt_preview = None
         st.session_state.order_mgmt_raw_data = None
         st.session_state.coupang_delivery_file = None
+        st.session_state.naver_delivery_file = None
         st.rerun()
 
 st.markdown("---")
