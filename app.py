@@ -8,6 +8,11 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+try:
+    import xlwt
+except ImportError:
+    xlwt = None
+
 # 페이지 설정
 st.set_page_config(
     page_title="자동 발주 파일 생성기",
@@ -28,7 +33,7 @@ MARKET_CONFIG = {
     'wadiz': {'key': '발송 처리용 주문', 'skip': 0, 'order': 6}
 }
 
-NAVER_DELIVERY_TEMPLATE_NAME = "네이버_엑셀발송_양식.xls"
+NAVER_DELIVERY_TEMPLATE_NAME = "excelUploadSample.xls"
 NAVER_DELIVERY_COLUMNS = ['상품주문번호', '배송방법', '택배사', '송장번호']
 NAVER_DELIVERY_COLUMN_ALIASES = {
     '상품주문번호': ['상품주문번호'],
@@ -38,6 +43,8 @@ NAVER_DELIVERY_COLUMN_ALIASES = {
 }
 NAVER_DELIVERY_METHOD = "택배,등기,소포"
 NAVER_DELIVERY_COMPANY = "CJ대한통운"
+NAVER_DELIVERY_XLS_MIME = "application/vnd.ms-excel"
+NAVER_DELIVERY_XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 def find_naver_delivery_template():
     for path in (
@@ -320,6 +327,27 @@ def _write_naver_delivery_xlsx(rows, template_content=None, template_name=None):
     output.seek(0)
     return output.getvalue()
 
+def _write_naver_delivery_xls(rows):
+    if xlwt is None:
+        return None
+
+    wb = xlwt.Workbook(encoding='utf-8')
+    ws = wb.add_sheet('발송처리')
+    text_style = xlwt.easyxf(num_format_str='@')
+
+    for col_idx, col_name in enumerate(NAVER_DELIVERY_COLUMNS):
+        ws.write(0, col_idx, col_name)
+
+    for row_idx, row_data in enumerate(rows, start=1):
+        for col_idx, col_name in enumerate(NAVER_DELIVERY_COLUMNS):
+            value = row_data.get(col_name, "")
+            ws.write(row_idx, col_idx, str(value), text_style)
+
+    output = io.BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return output.getvalue()
+
 def create_naver_delivery_file(file_content, file_name, invoice_map, template_content=None, template_name=None):
     df = _read_naver_order_df(file_content, file_name)
     if df is None or df.empty:
@@ -346,11 +374,24 @@ def create_naver_delivery_file(file_content, file_name, invoice_map, template_co
     if not rows:
         return None
 
-    return _write_naver_delivery_xlsx(
+    xls_output = _write_naver_delivery_xls(rows)
+    if xls_output:
+        return {
+            'data': xls_output,
+            'extension': 'xls',
+            'mime': NAVER_DELIVERY_XLS_MIME
+        }
+
+    xlsx_output = _write_naver_delivery_xlsx(
         rows,
         template_content=template_content,
         template_name=template_name
     )
+    return {
+        'data': xlsx_output,
+        'extension': 'xlsx',
+        'mime': NAVER_DELIVERY_XLSX_MIME
+    }
 
 def add_invoice_to_coupang(file_content, file_name, invoice_map):
     """쿠팡 파일에 운송장번호 추가 (서식 유지)"""
@@ -663,6 +704,8 @@ if 'coupang_delivery_file' not in st.session_state:
     st.session_state.coupang_delivery_file = None
 if 'naver_delivery_file' not in st.session_state:
     st.session_state.naver_delivery_file = None
+if 'naver_delivery_info' not in st.session_state:
+    st.session_state.naver_delivery_info = None
 if 'uploaded_market_files' not in st.session_state:
     st.session_state.uploaded_market_files = None
 
@@ -886,6 +929,8 @@ if 'order_mgmt_info' not in st.session_state:
     st.session_state.order_mgmt_info = None
 if 'naver_delivery_file' not in st.session_state:
     st.session_state.naver_delivery_file = None
+if 'naver_delivery_info' not in st.session_state:
+    st.session_state.naver_delivery_info = None
 
 col_a, col_b = st.columns(2)
 
@@ -925,7 +970,7 @@ naver_template_file = st.file_uploader(
     "네이버 엑셀발송 양식 업로드 (선택)",
     type=['xlsx', 'xls'],
     key="naver_template_upload",
-    help=f"업로드하지 않으면 sample_data/{NAVER_DELIVERY_TEMPLATE_NAME} 규격을 자동으로 사용합니다."
+    help=f"업로드하지 않으면 sample_data/{NAVER_DELIVERY_TEMPLATE_NAME} 공식 샘플 규격을 자동으로 사용합니다."
 )
 
 if st.button("🔗 주문관리시트 생성", type="primary", key="gen_order_mgmt"):
@@ -1262,6 +1307,7 @@ if st.button("🔗 주문관리시트 생성", type="primary", key="gen_order_mg
 
                     # 네이버 엑셀발송 파일 생성
                     naver_delivery = None
+                    naver_delivery_info = None
                     naver_template_content = None
                     naver_template_name = None
 
@@ -1283,6 +1329,10 @@ if st.button("🔗 주문관리시트 생성", type="primary", key="gen_order_mg
                             template_name=naver_template_name
                         )
                         if naver_delivery:
+                            naver_delivery_info = {
+                                'extension': naver_delivery['extension'],
+                                'mime': naver_delivery['mime']
+                            }
                             break
                     
                     # 엑셀 파일 생성
@@ -1307,7 +1357,8 @@ if st.button("🔗 주문관리시트 생성", type="primary", key="gen_order_mg
                     st.session_state.order_mgmt_preview = consolidated
                     st.session_state.order_mgmt_raw_data = all_orders
                     st.session_state.coupang_delivery_file = coupang_delivery
-                    st.session_state.naver_delivery_file = naver_delivery
+                    st.session_state.naver_delivery_file = naver_delivery['data'] if naver_delivery else None
+                    st.session_state.naver_delivery_info = naver_delivery_info
                     
                     st.success("✅ 주문관리시트 생성 완료!")
                     st.rerun()
@@ -1347,12 +1398,14 @@ if st.session_state.order_mgmt_file:
     if st.session_state.naver_delivery_file:
         with col3:
             now = datetime.now(ZoneInfo("Asia/Seoul"))
-            naver_filename = f"네이버발송_{now.strftime('%m%d_%H')}.xlsx"
+            naver_ext = (st.session_state.naver_delivery_info or {}).get('extension', 'xls')
+            naver_mime = (st.session_state.naver_delivery_info or {}).get('mime', NAVER_DELIVERY_XLS_MIME)
+            naver_filename = f"네이버발송_{now.strftime('%m%d_%H')}.{naver_ext}"
             st.download_button(
                 label="📦 네이버 발송 파일 다운로드",
                 data=st.session_state.naver_delivery_file,
                 file_name=naver_filename,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                mime=naver_mime,
                 use_container_width=True
             )
     
@@ -1412,6 +1465,7 @@ if st.session_state.order_mgmt_file:
         st.session_state.order_mgmt_raw_data = None
         st.session_state.coupang_delivery_file = None
         st.session_state.naver_delivery_file = None
+        st.session_state.naver_delivery_info = None
         st.rerun()
 
 st.markdown("---")
